@@ -115,6 +115,15 @@ Perl_gv_fetchfile_flags(pTHX_ const char *const name, const STRLEN namelen, cons
 #endif
 #include <stdio.h>
 
+#ifdef USE_CPERL
+# ifdef WIN32
+#  include <malloc.h>
+#  define alloca _alloca
+# else
+#  include <alloca.h>
+# endif
+#endif
+
 #ifdef HAS_ZLIB
 #include <zlib.h>
 #define default_compression_level 6
@@ -496,7 +505,7 @@ typedef OP * (CPERLscope(*orig_ppaddr_t))(pTHX);
 orig_ppaddr_t *PL_ppaddr_orig;
 #define run_original_op(type) CALL_FPTR(PL_ppaddr_orig[type])(aTHX)
 static OP *pp_entersub_profiler(pTHX);
-static OP *pp_subcall_profiler(pTHX_ int type);
+static OP *pp_subcall_profiler(pTHX_ int is_slowop);
 static OP *pp_leave_profiler(pTHX);
 static HV *sub_callers_hv;
 static HV *pkg_fids_hv;     /* currently just package names */
@@ -1157,10 +1166,10 @@ get_file_id(pTHX_ char* file_name, STRLEN file_name_len, int created_via)
     ) {
         char file_name_abs[MAXPATHLEN * 2];
         /* Note that the current directory may have changed
-            * between loading the file and profiling it.
-            * We don't use realpath() or similar here because we want to
-            * keep the view of symlinks etc. as the program saw them.
-            */
+         * between loading the file and profiling it.
+         * We don't use realpath() or similar here because we want to
+         * keep the view of symlinks etc. as the program saw them.
+         */
         if (!getcwd(file_name_abs, sizeof(file_name_abs))) {
             /* eg permission */
             logwarn("getcwd: %s\n", strerror(errno));
@@ -1223,7 +1232,7 @@ get_file_id(pTHX_ char* file_name, STRLEN file_name_len, int created_via)
     if (trace_level >= 2) {
         char buf[80];
         /* including last_executed_fid can be handy for tracking down how
-            * a file got loaded */
+         * a file got loaded */
         logwarn("New fid %2u (after %2u:%-4u) 0x%02x e%u:%u %.*s %s %s\n",
             found->he.id, last_executed_fid, last_executed_line,
             found->fid_flags, found->eval_fid, found->eval_line_num,
@@ -2060,7 +2069,7 @@ append_linenum_to_begin(pTHX_ subr_entry_t *subr_entry) {
 
     if (DBsv && parse_DBsub_value(aTHX_ DBsv, NULL, &line, NULL, SvPVX(fullnamesv))) {
         (void)SvREFCNT_inc(DBsv); /* was made mortal by hv_delete */
-        sv_catpvf(fullnamesv,                   "@%u", (unsigned int)line);
+        sv_catpvf(fullnamesv, "@%u", (unsigned int)line);
         if (hv_fetch(GvHV(PL_DBsub), SvPV_nolen(fullnamesv), (I32)SvCUR(fullnamesv), 0)) {
             static unsigned int dup_begin_seqn;
             sv_catpvf(fullnamesv, ".%u", ++dup_begin_seqn);
@@ -2117,9 +2126,13 @@ subr_entry_destroy(pTHX_ subr_entry_t *subr_entry)
     }
     if (subr_entry->prev_subr_entry_ix <= subr_entry_ix)
         subr_entry_ix = subr_entry->prev_subr_entry_ix;
-    else
+    else {
+#ifdef USE_CPERL
+      if (trace_level)
+#endif
         logwarn("skipped attempt to raise subr_entry_ix from %d to %d\n",
-            (int)subr_entry_ix, (int)subr_entry->prev_subr_entry_ix);
+                (int)subr_entry_ix, (int)subr_entry->prev_subr_entry_ix);
+    }
 }
 
 
@@ -2706,9 +2719,7 @@ pp_subcall_profiler(pTHX_ int is_slowop)
     OP *next_op = PL_op->op_next;                 /* op to execute after sub returns */
     /* pp_entersub can be called with PL_op->op_type==0 */
     OPCODE op_type = (is_slowop || (opcode) PL_op->op_type == OP_GOTO)
-      ? (opcode) PL_op->op_type
-      : PL_op->op_type
-        ? PL_op->op_type : OP_ENTERSUB;
+      ? PL_op->op_type : PL_op->op_type ? PL_op->op_type : OP_ENTERSUB;
 
     CV *called_cv;
     dSP;
@@ -3333,9 +3344,9 @@ init_profiler(pTHX)
     PL_ppaddr[OP_ENTERSUB] = pp_entersub_profiler;
 #ifdef USE_CPERL /* since cperl-5.22.1 */
     PL_ppaddr[OP_ENTERXSSUB] = pp_entersub_profiler;
-    /* TODO: cperl-5.29?
+# if PERL_VERSION_GE(5,29,0)
     PL_ppaddr[OP_ENTERFFI] = pp_entersub_profiler;
-    */
+# endif
 #endif
     PL_ppaddr[OP_GOTO]     = pp_entersub_profiler;
 
@@ -3453,8 +3464,17 @@ sub_pkg_filename_sv(pTHX_ char *sub_name, I32 len)
 {
     SV **svp;
     STRLEN pkg_len = pkg_name_len(aTHX_ sub_name, len);
-    if (!pkg_len)
-        return Nullsv;   /* no :: delimiter */
+    if (!pkg_len) {
+#ifdef USE_CPERL
+      /* cperl doesn't store the main:: prefix in PL_DBsub hash keys */
+      svp = hv_fetch(pkg_fids_hv, "main", 4, 0);
+      if (!svp)
+        return Nullsv;
+      return *svp;
+#else
+      return Nullsv;   /* no :: delimiter */
+#endif
+    }
     svp = hv_fetch(pkg_fids_hv, sub_name, (I32)pkg_len, 0);
     if (!svp)
         return Nullsv;   /* not a package we've profiled sub calls into */
@@ -3526,6 +3546,8 @@ write_sub_line_ranges(pTHX)
         STRLEN filename_len;
         SV *pkg_filename_sv;
 
+        /* Note: cperl doesn't store main:: prefixes in the PL_DBsub */
+
         /* This is a heuristic, and might not be robust, but it seems that
            it's possible to get problematically bogus entries in this hash.
            Specifically, setting the 'lvalue' attribute on an XS subroutine
@@ -3551,8 +3573,32 @@ write_sub_line_ranges(pTHX)
         /* get sv for package-of-subname to filename mapping */
         pkg_filename_sv = sub_pkg_filename_sv(aTHX_ sub_name, sub_name_len);
 
-        if (!pkg_filename_sv) /* we don't know package */
+        if (!pkg_filename_sv) { /* we don't know package */
+            if (trace_level >= 4)
+                logwarn("Sub %.*s has no known package (%s) - ignored\n",
+                    (int)sub_name_len, sub_name, filename);
             continue;
+        }
+
+        /* cperl sub without main:: prefix */
+#ifdef USE_CPERL
+        if (!pkg_name_len(sub_name, sub_name_len)) {
+          /* Note that even __ANON__ gets stuffed into main:: */
+          char *tmp_sub;
+          if (sub_name_len < 4096)
+            tmp_sub = (char*)alloca(sub_name_len + 7);
+          else
+            /* let it leak for now */
+            tmp_sub = (char*)safemalloc(sub_name_len + 7);
+          strcpy(tmp_sub, "main::");
+          strcat(tmp_sub, sub_name);
+          sub_name = tmp_sub;
+          sub_name_len += 6;
+          if (trace_level >= 8)
+            logwarn("cperl sub %.*s got main:: added (%s)\n",
+                    (int)sub_name_len, sub_name, filename);
+        }
+#endif
 
         /* already got a cached filename for this package XXX should allow multiple */
         if (SvOK(pkg_filename_sv)) {
@@ -3643,6 +3689,24 @@ write_sub_line_ranges(pTHX)
         STRLEN filename_len;
         UV first_line, last_line;
 
+#ifdef USE_CPERL
+        if (!pkg_name_len(sub_name, sub_name_len)) {
+          char *tmp_sub;
+          if (sub_name_len < 4096)
+            tmp_sub = (char*)alloca(sub_name_len + 7);
+          else
+            /* let it leak for now */
+            tmp_sub = (char*)safemalloc(sub_name_len + 7);
+          strcpy(tmp_sub, "main::");
+          strcat(tmp_sub, sub_name);
+          sub_name = tmp_sub;
+          sub_name_len += 6;
+          if (trace_level >= 8)
+            logwarn("cperl sub %.*s got main:: added (%s)\n",
+                    (int)sub_name_len, sub_name, filename);
+        }
+#endif
+
         if (!parse_DBsub_value(aTHX_ file_lines_sv, &filename_len, &first_line, &last_line, sub_name)) {
             logwarn("Can't parse %%DB::sub entry for %s '%s'\n", sub_name, filename);
             continue;
@@ -3653,9 +3717,9 @@ write_sub_line_ranges(pTHX)
             SV *pkg_filename_sv = sub_pkg_filename_sv(aTHX_ sub_name, sub_name_len);
             if (pkg_filename_sv && SvOK(pkg_filename_sv)) {
                 filename = SvPV(pkg_filename_sv, filename_len);
-            if (trace_level >= 2)
-                logwarn("Sub %s is xsub, we'll associate it with filename %.*s\n",
-                    sub_name, (int)filename_len, filename);
+                if (trace_level >= 2)
+                  logwarn("Sub %s is xsub, we'll associate it with filename %.*s\n",
+                          sub_name, (int)filename_len, filename);
             }
         }
 
